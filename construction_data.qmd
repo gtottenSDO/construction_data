@@ -29,7 +29,9 @@ download_once <- function(url, dest) {
       error = function(e) FALSE
     )
     if (!ok) {
-      if (file.exists(dest)) file.remove(dest)
+      if (file.exists(dest)) {
+        file.remove(dest)
+      }
       return(NA_character_)
     }
   }
@@ -54,7 +56,11 @@ read_nrstate_co <- function(path) {
   year_cols <- which(!is.na(suppressWarnings(as.numeric(unlist(year_hdr)))))
   years <- as.integer(unlist(year_hdr[year_cols]))
 
-  name_col <- which(vapply(raw, \(col) any(col == "Colorado", na.rm = TRUE), logical(1)))
+  name_col <- which(vapply(
+    raw,
+    \(col) any(col == "Colorado", na.rm = TRUE),
+    logical(1)
+  ))
   stopifnot(length(name_col) == 1)
   co_row <- raw[which(raw[[name_col]] == "Colorado"), ]
   stopifnot(nrow(co_row) == 1)
@@ -66,15 +72,20 @@ read_nrstate_co <- function(path) {
 }
 
 c30_sources <- tribble(
-  ~url, ~file,
-  "https://www.census.gov/construction/c30/xls/nrstatehs.xls", "nrstatehs_1993_2007.xls",
-  "https://www.census.gov/construction/c30/xlsx/nrstatehs1.xlsx", "nrstatehs1_2008_2021.xlsx",
-  "https://www.census.gov/construction/c30/xlsx/nrstate.xlsx", "nrstate_current.xlsx"
+  ~url                                                           , ~file                       ,
+  "https://www.census.gov/construction/c30/xls/nrstatehs.xls"    , "nrstatehs_1993_2007.xls"   ,
+  "https://www.census.gov/construction/c30/xlsx/nrstatehs1.xlsx" , "nrstatehs1_2008_2021.xlsx" ,
+  "https://www.census.gov/construction/c30/xlsx/nrstate.xlsx"    , "nrstate_current.xlsx"
 )
 
-c30_paths <- map2_chr(c30_sources$url, c30_sources$file, \(u, f) download_once(u, file.path(raw_dir, f)))
+c30_paths <- map2_chr(c30_sources$url, c30_sources$file, \(u, f) {
+  download_once(u, file.path(raw_dir, f))
+})
 if (anyNA(c30_paths)) {
-  message("C30 download failed: ", paste(c30_sources$file[is.na(c30_paths)], collapse = ", "))
+  message(
+    "C30 download failed: ",
+    paste(c30_sources$file[is.na(c30_paths)], collapse = ", ")
+  )
 }
 
 const_value_state <- c30_paths[!is.na(c30_paths)] |>
@@ -93,7 +104,9 @@ const_value_state <- c30_paths[!is.na(c30_paths)] |>
 
 message(sprintf(
   "C30 nonresidential value, CO: %d years (%d-%d)",
-  nrow(const_value_state), min(const_value_state$year), max(const_value_state$year)
+  nrow(const_value_state),
+  min(const_value_state$year),
+  max(const_value_state$year)
 ))
 ```
 
@@ -118,21 +131,28 @@ the real proof, not the doc text.
 ```{r}
 #| label: bps_download_parse
 
-this_year <- as.integer(format(Sys.Date(), "%Y"))
+this_year <- as.integer(format(Sys.Date(), "%Y")) - 1
 
 fetch_bps_annual <- function(geo, years) {
   prefix <- if (geo == "state") "st" else "co"
-  base_url <- sprintf("https://www2.census.gov/econ/bps/%s/", if (geo == "state") "State" else "County")
+  base_url <- sprintf(
+    "https://www2.census.gov/econ/bps/%s/",
+    if (geo == "state") "State" else "County"
+  )
   map(years, \(y) {
     fname <- sprintf("%s%da.txt", prefix, y)
     dest <- download_once(paste0(base_url, fname), file.path(raw_dir, fname))
-    if (is.na(dest)) return(NULL)
+    if (is.na(dest)) {
+      return(NULL)
+    }
     n_id_cols <- if (geo == "state") 5L else 6L
     # FIPS columns look numeric to read_csv's type guesser, which would drop
     # the zero-padding (state "08" -> 8, county "001" -> 1) -- force character.
     df <- suppressWarnings(read_csv(
       dest,
-      skip = 3, col_names = FALSE, show_col_types = FALSE,
+      skip = 3,
+      col_names = FALSE,
+      show_col_types = FALSE,
       col_types = cols(X2 = "c", .default = "c")
     ))
     # which() (not a logical mask) -- an NA in a logical subscript produces an
@@ -140,11 +160,17 @@ fetch_bps_annual <- function(geo, years) {
     # dividers, etc.) make as.integer() coercion produce exactly that NA.
     fips_num <- suppressWarnings(as.integer(df[[2]]))
     df <- df[which(fips_num == 8L), , drop = FALSE]
-    if (nrow(df) == 0) return(NULL)
+    if (nrow(df) == 0) {
+      return(NULL)
+    }
     tibble(
       year = y,
       state_fips = sprintf("%02d", as.integer(df[[2]])),
-      county_fips = if (geo == "county") sprintf("%03d", as.integer(df[[3]])) else NA_character_,
+      county_fips = if (geo == "county") {
+        sprintf("%03d", as.integer(df[[3]]))
+      } else {
+        NA_character_
+      },
       units_1unit = as.numeric(df[[n_id_cols + 2]]),
       value_1unit = as.numeric(df[[n_id_cols + 3]]),
       units_2unit = as.numeric(df[[n_id_cols + 5]]),
@@ -178,17 +204,29 @@ const_permits_state <- tidy_bps(bps_state_raw, value_scale = 1000) |>
 
 const_permits_county <- tidy_bps(bps_county_raw, value_scale = 1) |>
   mutate(source = "census_bps_county") |>
-  select(year, state_fips, county_fips, totperm, totval, units_1unit:value_5punit, source) |>
+  select(
+    year,
+    state_fips,
+    county_fips,
+    totperm,
+    totval,
+    units_1unit:value_5punit,
+    source
+  ) |>
   arrange(year, county_fips)
 
 message(sprintf(
   "BPS state permits, CO: %d years (%d-%d)",
-  nrow(const_permits_state), min(const_permits_state$year), max(const_permits_state$year)
+  nrow(const_permits_state),
+  min(const_permits_state$year),
+  max(const_permits_state$year)
 ))
 message(sprintf(
   "BPS county permits, CO: %d rows, %d counties, %d-%d",
-  nrow(const_permits_county), n_distinct(const_permits_county$county_fips),
-  min(const_permits_county$year), max(const_permits_county$year)
+  nrow(const_permits_county),
+  n_distinct(const_permits_county$county_fips),
+  min(const_permits_county$year),
+  max(const_permits_county$year)
 ))
 ```
 
@@ -203,7 +241,10 @@ signals a unit or parsing regression.
 
 state_vs_county <- const_permits_county |>
   summarize(totval_county_sum = sum(totval, na.rm = TRUE), .by = year) |>
-  inner_join(const_permits_state |> select(year, totval_state = totval), by = "year") |>
+  inner_join(
+    const_permits_state |> select(year, totval_state = totval),
+    by = "year"
+  ) |>
   mutate(pct_diff = (totval_county_sum - totval_state) / totval_state)
 
 state_vs_county |> arrange(year)
