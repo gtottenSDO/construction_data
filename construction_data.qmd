@@ -1,0 +1,264 @@
+---
+
+---
+
+Downloads and cleans Colorado construction data from two federal sources with no
+API yet, and loads it into the SDO Postgres database. Re-render this notebook
+whenever Census/BPS publish a new annual vintage -- everything below is written
+to run unattended top to bottom.
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(readr)
+library(readxl)
+library(DBI)
+library(sdotools) # sdo_db_connect()
+
+raw_dir <- "raw_files"
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+
+download_once <- function(url, dest) {
+  if (!file.exists(dest)) {
+    ok <- tryCatch(
+      {
+        utils::download.file(url, dest, mode = "wb", quiet = TRUE)
+        TRUE
+      },
+      error = function(e) FALSE
+    )
+    if (!ok) {
+      if (file.exists(dest)) file.remove(dest)
+      return(NA_character_)
+    }
+  }
+  dest
+}
+```
+
+## Census C30: nonresidential value put in place (state only)
+
+No county breakdown exists in C30 at all -- it's not published below the state
+level. The Census site splits history into non-overlapping vintage files that
+get re-cut over time; three are stitched together here for 1993-present. The
+row label ("Colorado") is matched by text, not column position -- the state
+name lands in a different column across the three vintages' layouts.
+
+```{r}
+#| label: c30_download_parse
+
+read_nrstate_co <- function(path) {
+  raw <- read_excel(path, sheet = 1, col_names = FALSE)
+  year_hdr <- raw[4, ]
+  year_cols <- which(!is.na(suppressWarnings(as.numeric(unlist(year_hdr)))))
+  years <- as.integer(unlist(year_hdr[year_cols]))
+
+  name_col <- which(vapply(raw, \(col) any(col == "Colorado", na.rm = TRUE), logical(1)))
+  stopifnot(length(name_col) == 1)
+  co_row <- raw[which(raw[[name_col]] == "Colorado"), ]
+  stopifnot(nrow(co_row) == 1)
+
+  tibble(
+    year = years,
+    value_millions = as.numeric(unlist(co_row[1, year_cols]))
+  )
+}
+
+c30_sources <- tribble(
+  ~url, ~file,
+  "https://www.census.gov/construction/c30/xls/nrstatehs.xls", "nrstatehs_1993_2007.xls",
+  "https://www.census.gov/construction/c30/xlsx/nrstatehs1.xlsx", "nrstatehs1_2008_2021.xlsx",
+  "https://www.census.gov/construction/c30/xlsx/nrstate.xlsx", "nrstate_current.xlsx"
+)
+
+c30_paths <- map2_chr(c30_sources$url, c30_sources$file, \(u, f) download_once(u, file.path(raw_dir, f)))
+if (anyNA(c30_paths)) {
+  message("C30 download failed: ", paste(c30_sources$file[is.na(c30_paths)], collapse = ", "))
+}
+
+const_value_state <- c30_paths[!is.na(c30_paths)] |>
+  map(read_nrstate_co) |>
+  bind_rows() |>
+  arrange(desc(year)) |>
+  distinct(year, .keep_all = TRUE) |> # newer vintage wins if a future re-cut overlaps years
+  arrange(year) |>
+  mutate(
+    state_fips = "08",
+    value = value_millions * 1e6, # native unit is millions; stored here as actual dollars
+    source = "census_c30_nrstate",
+    category = "nres"
+  ) |>
+  select(year, state_fips, category, value, source)
+
+message(sprintf(
+  "C30 nonresidential value, CO: %d years (%d-%d)",
+  nrow(const_value_state), min(const_value_state$year), max(const_value_state$year)
+))
+```
+
+## Census/HUD BPS: residential building permits (state and county)
+
+Annual files are stable-format ASCII, comma-delimited, 3 header lines then
+data (spot-checked 1980/1991-2024: 29 state / 30 county columns throughout,
+despite the CO county row count itself growing 62->64 around 2010 when
+Broomfield County split off -- that's real, not a parsing artifact). Columns
+6:17 (state) / 7:18 (county) are "Estimates with Imputation" --
+Buildings/Units/Valuation x {1-unit, 2-units, 3-4 units, 5+ units} -- the
+headline published series; "Reported Only" columns are dropped.
+
+**Unit gotcha, verified empirically (not just from the Census PDFs, which
+document both identically as "thousands of dollars"):** BPS *state* valuation
+fields are thousands of dollars; BPS *county* valuation fields are already
+actual dollars. Both are normalized to actual dollars below. The
+state-vs-sum-of-counties reconciliation check further down would be off by a
+factor of ~1000 if this were backwards -- it isn't, so treat that check as
+the real proof, not the doc text.
+
+```{r}
+#| label: bps_download_parse
+
+this_year <- as.integer(format(Sys.Date(), "%Y"))
+
+fetch_bps_annual <- function(geo, years) {
+  prefix <- if (geo == "state") "st" else "co"
+  base_url <- sprintf("https://www2.census.gov/econ/bps/%s/", if (geo == "state") "State" else "County")
+  map(years, \(y) {
+    fname <- sprintf("%s%da.txt", prefix, y)
+    dest <- download_once(paste0(base_url, fname), file.path(raw_dir, fname))
+    if (is.na(dest)) return(NULL)
+    n_id_cols <- if (geo == "state") 5L else 6L
+    # FIPS columns look numeric to read_csv's type guesser, which would drop
+    # the zero-padding (state "08" -> 8, county "001" -> 1) -- force character.
+    df <- suppressWarnings(read_csv(
+      dest,
+      skip = 3, col_names = FALSE, show_col_types = FALSE,
+      col_types = cols(X2 = "c", .default = "c")
+    ))
+    # which() (not a logical mask) -- an NA in a logical subscript produces an
+    # all-NA row rather than dropping it, and non-numeric leftover rows (blank
+    # dividers, etc.) make as.integer() coercion produce exactly that NA.
+    fips_num <- suppressWarnings(as.integer(df[[2]]))
+    df <- df[which(fips_num == 8L), , drop = FALSE]
+    if (nrow(df) == 0) return(NULL)
+    tibble(
+      year = y,
+      state_fips = sprintf("%02d", as.integer(df[[2]])),
+      county_fips = if (geo == "county") sprintf("%03d", as.integer(df[[3]])) else NA_character_,
+      units_1unit = as.numeric(df[[n_id_cols + 2]]),
+      value_1unit = as.numeric(df[[n_id_cols + 3]]),
+      units_2unit = as.numeric(df[[n_id_cols + 5]]),
+      value_2unit = as.numeric(df[[n_id_cols + 6]]),
+      units_3to4unit = as.numeric(df[[n_id_cols + 8]]),
+      value_3to4unit = as.numeric(df[[n_id_cols + 9]]),
+      units_5punit = as.numeric(df[[n_id_cols + 11]]),
+      value_5punit = as.numeric(df[[n_id_cols + 12]])
+    )
+  }) |>
+    compact() |>
+    bind_rows()
+}
+
+bps_state_raw <- fetch_bps_annual("state", 1980:this_year)
+bps_county_raw <- fetch_bps_annual("county", 1991:this_year)
+
+tidy_bps <- function(df, value_scale) {
+  df |>
+    mutate(across(starts_with("value_"), \(v) v * value_scale)) |>
+    mutate(
+      totperm = units_1unit + units_2unit + units_3to4unit + units_5punit,
+      totval = value_1unit + value_2unit + value_3to4unit + value_5punit
+    )
+}
+
+const_permits_state <- tidy_bps(bps_state_raw, value_scale = 1000) |>
+  mutate(source = "census_bps_state") |>
+  select(year, state_fips, totperm, totval, units_1unit:value_5punit, source) |>
+  arrange(year)
+
+const_permits_county <- tidy_bps(bps_county_raw, value_scale = 1) |>
+  mutate(source = "census_bps_county") |>
+  select(year, state_fips, county_fips, totperm, totval, units_1unit:value_5punit, source) |>
+  arrange(year, county_fips)
+
+message(sprintf(
+  "BPS state permits, CO: %d years (%d-%d)",
+  nrow(const_permits_state), min(const_permits_state$year), max(const_permits_state$year)
+))
+message(sprintf(
+  "BPS county permits, CO: %d rows, %d counties, %d-%d",
+  nrow(const_permits_county), n_distinct(const_permits_county$county_fips),
+  min(const_permits_county$year), max(const_permits_county$year)
+))
+```
+
+## Sanity check: state total vs. sum of counties
+
+Same year, same (now-normalized) units -- these should track closely. County
+reporting is opt-in, so a small gap is expected in thin years; anything large
+signals a unit or parsing regression.
+
+```{r}
+#| label: reconcile
+
+state_vs_county <- const_permits_county |>
+  summarize(totval_county_sum = sum(totval, na.rm = TRUE), .by = year) |>
+  inner_join(const_permits_state |> select(year, totval_state = totval), by = "year") |>
+  mutate(pct_diff = (totval_county_sum - totval_state) / totval_state)
+
+state_vs_county |> arrange(year)
+```
+
+## Write to Postgres
+
+Full overwrite each run (small tables, annual data does get revised) --
+matches `process_lehd`'s `econ.commute` pattern, not the newer
+`sdo_db_write_table()` model-tracking wrapper (`econ.lehd_mjh` /
+`econ.commute` have no `model_id` column, and downstream readers in
+`state_forecast_2025` don't pass `filter_model_id`).
+
+```{r}
+#| label: write_postgres
+
+pg <- sdo_db_connect()
+
+dbWriteTable(
+  pg,
+  name = Id(schema = "econ", table = "construction_value_state"),
+  const_value_state,
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+dbWriteTable(
+  pg,
+  name = Id(schema = "econ", table = "construction_permits_state"),
+  const_permits_state,
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+dbWriteTable(
+  pg,
+  name = Id(schema = "econ", table = "construction_permits_county"),
+  const_permits_county,
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+dbDisconnect(pg)
+message("Wrote 3 tables to econ schema.")
+```
+
+## Local CSV mirror
+
+Committed to git as an audit trail -- same pattern as `process_lehd`'s
+`lehd_mjh.csv`.
+
+```{r}
+#| label: write_csv
+
+write_csv(const_value_state, "construction_value_state.csv")
+write_csv(const_permits_state, "construction_permits_state.csv")
+write_csv(const_permits_county, "construction_permits_county.csv")
+```
